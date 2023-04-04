@@ -1,0 +1,263 @@
+---
+title: "Excercise 4 - Centrality & Efficiency"
+output: pdf_document
+author: Hugo Garcia (260791363)
+date: March 4th, 2023
+---
+
+```{r setup, include=FALSE}
+#knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(lubridate)
+library(arrow)
+library(tidygraph)
+library(ggraph)
+```
+
+## Load data
+Load the following data:
+  + applications from `app_data_sample.parquet`
+  + edges from `edges_sample.csv`
+
+```{r}
+# change to your own path!
+data_path <- "C:/Users/hugog/Desktop/Exercise 4/"
+applications <- read_parquet(paste0(data_path,"app_data_sample.parquet"))
+edges <- read_csv(paste0(data_path,"edges_sample.csv"))
+
+applications
+edges
+```
+
+
+## Get gender for examiners
+``` {r}
+library(gender)
+examiner_names <- applications %>% 
+  distinct(examiner_name_first)
+examiner_names
+```
+
+## Get a table of names and gender
+```{r}
+examiner_names_gender <- examiner_names %>% 
+  do(results = gender(.$examiner_name_first, method = "ssa")) %>% 
+  unnest(cols = c(results), keep_empty = TRUE) %>% 
+  select(
+    examiner_name_first = name,
+    gender,
+    proportion_female
+  )
+examiner_names_gender
+```
+
+
+```{r}
+# remove extra colums from the gender table
+examiner_names_gender <- examiner_names_gender %>% 
+  select(examiner_name_first, gender)
+# joining gender back to the dataset
+applications <- applications %>% 
+  left_join(examiner_names_gender, by = "examiner_name_first")
+# cleaning up
+rm(examiner_names)
+rm(examiner_names_gender)
+gc()
+```
+
+
+```{r}
+library(wru)
+examiner_surnames <- applications %>% 
+  select(surname = examiner_name_last) %>% 
+  distinct()
+examiner_surnames
+```
+
+We'll follow the instructions for the package outlined here [https://github.com/kosukeimai/wru](https://github.com/kosukeimai/wru).
+
+NOTE: I was getting errors running the original code block for examiner_race. I tried updating packages, and debugging for a long time but I believe it is my computer's software/environment setup preventing me. I asked for the csv output from a peer and am importing it instead.
+Original code bloack:
+  examiner_race <- predict_race(voter.file = examiner_surnames, surname.only = T) %>% 
+    as_tibble()
+  examiner_race
+
+```{r race-2}
+examiner_race <- read_csv(paste0(data_path,"examiner_race.csv"))
+examiner_race
+```
+
+```{r}
+examiner_race <- examiner_race %>% 
+  mutate(max_race_p = pmax(pred.asi, pred.bla, pred.his, pred.oth, pred.whi)) %>% 
+  mutate(race = case_when(
+    max_race_p == pred.asi ~ "Asian",
+    max_race_p == pred.bla ~ "black",
+    max_race_p == pred.his ~ "Hispanic",
+    max_race_p == pred.oth ~ "other",
+    max_race_p == pred.whi ~ "white",
+    TRUE ~ NA_character_
+  ))
+examiner_race
+```
+
+Join the data back to the applications table.
+```{r}
+# removing extra columns
+examiner_race <- examiner_race %>% 
+  select(surname,race)
+applications <- applications %>% 
+  left_join(examiner_race, by = c("examiner_name_last" = "surname"))
+rm(examiner_race)
+rm(examiner_surnames)
+gc()
+```
+## Add Tenure
+```{r}
+library(lubridate) # to work with dates
+examiner_dates <- applications %>% 
+  select(examiner_id, filing_date, appl_status_date) 
+examiner_dates
+```
+
+```{r}
+examiner_dates <- examiner_dates %>% 
+  mutate(start_date = ymd(filing_date), end_date = as_date(dmy_hms(appl_status_date)))
+```
+
+```{r}
+examiner_dates <- examiner_dates %>% 
+  group_by(examiner_id) %>% 
+  summarise(
+    earliest_date = min(start_date, na.rm = TRUE), 
+    latest_date = max(end_date, na.rm = TRUE),
+    tenure_days = interval(earliest_date, latest_date) %/% days(1)
+    ) %>% 
+  filter(year(latest_date)<2018)
+examiner_dates
+```
+```{r}
+applications <- applications %>% 
+  left_join(examiner_dates, by = "examiner_id")
+rm(examiner_dates)
+gc()
+```
+
+## Pre-Processing
+
+```{r}
+library(tidyverse)
+# Select applications have been either abandoned or issued
+abandoned_apps = applications[!is.na(applications$abandon_date),]
+issued_apps = applications[!is.na(applications$patent_issue_date),]
+
+# Rename and remove unnecessary columns
+abandoned_apps = abandoned_apps %>% rename(end_date = abandon_date) %>% select(-c('patent_issue_date'))
+issued_apps = issued_apps %>% rename(end_date = patent_issue_date) %>% select(-c('abandon_date'))
+issued_apps$issued = 1
+abandoned_apps$issued = 0
+
+# Combine abandoned and issued dates
+applications = rbind(abandoned_apps, issued_apps)
+rm(abandoned_apps, issued_apps)
+```
+
+## Calculate Application Processing Times
+
+```{r}
+app_proc_time = applications$end_date - applications$filing_date
+app_proc_time = as.numeric(app_proc_time)
+summary(app_proc_time)
+```
+```{r}
+# There were some errors in the dates which led to negative app_proc_time, remove these
+applications$app_proc_time = app_proc_time
+applications = applications[applications$app_proc_time >=0, ]
+```
+
+
+## Calculate Centrality Scores for Each Examiner
+
+```{r}
+edges = edges %>% rename(to = alter_examiner_id,
+                     from = ego_examiner_id)
+
+# This is a directed  network, so Directed=TRUE
+graph = as_tbl_graph(x = edges[c('to','from')], directed = TRUE , mode = 'out')
+nodes = graph %>%
+  activate(nodes) %>%
+  mutate(degree = centrality_degree(), 
+         closeness = centrality_closeness(),
+         betweenness = centrality_betweenness()) %>% 
+  rename(examiner_id = name) %>%  data.frame()
+applications$examiner_id = as.character(applications$examiner_id)
+applications = applications %>% left_join(nodes, by = 'examiner_id')
+```
+## Drop NA Vaues and Set some Variables as factor
+
+```{r}
+attach(applications)
+applications = applications %>% drop_na(gender)
+applications = applications %>% drop_na(race)
+applications = applications %>% drop_na(degree)
+applications = applications %>% drop_na(closeness)
+applications = applications %>% drop_na(betweenness)
+applications = applications %>% drop_na(tenure_days)
+
+applications$gender = as.factor(applications$gender)
+applications$race = as.factor(applications$race)
+
+```
+
+## Use a Linear Regression Model to Estimate the Relationship between Centrality and Application Processing Times 
+### Controlling for other characteristics of the examiner which might influence that relationship
+
+```{r}
+applications_lm <- applications
+lm = lm(applications_lm$app_proc_time ~ 
+            applications_lm$degree + 
+            applications_lm$closeness + 
+            applications_lm$betweenness + 
+            applications_lm$gender + 
+            applications_lm$race + 
+            applications_lm$issued +
+          applications_lm$tenure_days)
+summary(lm)
+
+```
+
+## Results 1
+
+All independent variables are significant to predict the number of days to process a patent, except "Race - Other", and to a lesser degree of significance "Race- Hispanic", which is likely a result of there being relatively fewer Hispanic Examiners and thus fewer applications in total on their behalf.
+ 
+The multiple R-squared value of 0.01011 indicates that the independent variables explain just 1% of the variation in the applications processing times. 
+We also see that Closeness Centrality significantly influences application processing time whereby each additional degree of closeness decreases the application processing time by 118 days. Similarly for Degree of Centrality, but to a lesser extent, each additional Degree of Centrality decreases application processing time by about 20 days. 
+Lastly, the Tenure of an examiner significantly influences their application processing times whereby each  
+
+In addition, based on the regression model's output we can also make comparisons between examiner characteristics and how they relate to their application processing times:
+
+- Male Examiners take about 35 days longer, on average, to process applications than female examiners
+- White Examiners take about 58 days less, on average, to process applications.
+
+## Linear Regression Including Interaction Variables for Gender and Centrality
+
+```{r}
+lm_2 = lm(applications_lm$app_proc_time ~ 
+            applications_lm$degree + 
+            applications_lm$closeness + 
+            applications_lm$betweenness + 
+            applications_lm$gender + 
+            applications_lm$race + 
+            applications_lm$tenure_days+
+            applications_lm$issued + 
+            (applications_lm$gender*applications_lm$degree) + 
+            (applications_lm$gender*applications_lm$betweenness) + 
+            (applications_lm$gender*applications_lm$closeness))
+summary(lm_2)
+```
+
+## Results 2
+
+We see similar results than in the regression above for the significance of the independent variables.
+Regarding the interactions between gender and centrality measures, all are statistically significant.
+
